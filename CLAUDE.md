@@ -2,7 +2,10 @@
 
 ## Mission
 
-**Make money legally.** Find real demand, build valuable products, deploy, and generate revenue. This is the only goal.
+**Ship the one product defined in `MISSION.md`.** The product is already chosen and is not
+open for reconsideration. Do not search for demand, do not evaluate alternatives, do not
+start a second product. Success is every criterion in that file's Definition of Done met
+and demonstrated. `MISSION.md` overrides this file wherever the two disagree.
 
 ## Operating Mode
 
@@ -14,7 +17,8 @@ This is a **fully autonomous AI company** with no human involvement in daily dec
 - **CEO (Bezos) is the final decision-maker** when team opinions diverge.
 - **Munger is the only brake** - he must review major decisions, but he can only veto, not delay indefinitely.
 
-Humans guide direction only by editing `memories/consensus.md` under "Next Action".
+Humans set the product by editing `MISSION.md` (with the loop stopped) and steer within it
+by editing `memories/consensus.md` under "Next Action".
 
 ## Safety Guardrails (Non-Negotiable)
 
@@ -79,7 +83,7 @@ Humans guide direction only by editing `memories/consensus.md` under "Next Actio
 
 1. **Ship > Plan > Discuss** - if you can ship, do not over-discuss.
 2. **Act at 70% information** - waiting for 90% is usually too slow.
-3. **Customer-first** - build for real demand, not internal hype.
+3. **Mission-first** - build what `MISSION.md` specifies, not what seems more interesting.
 4. **Prefer simplicity** - do not split what one person can finish; delete what is unnecessary.
 5. **Ramen profitability first** - revenue before vanity growth.
 6. **Boring technology first** - use proven tech unless new tech gives clear 10x upside.
@@ -94,7 +98,9 @@ Team composition rules: `.claude/skills/team/SKILL.md`.
 3. **Product Launch**: `qa-bach` -> `devops-hightower` -> `marketing-godin` -> `sales-ross` -> `operations-pg` -> `ceo-bezos`
 4. **Pricing and Monetization**: `research-thompson` -> `cfo-campbell` -> `sales-ross` -> `critic-munger` -> `ceo-bezos`
 5. **Weekly Review**: `operations-pg` -> `sales-ross` -> `cfo-campbell` -> `qa-bach` -> `ceo-bezos`
-6. **Opportunity Discovery**: `research-thompson` -> `ceo-bezos` -> `critic-munger` -> `cfo-campbell`
+6. ~~Opportunity Discovery~~ - **removed.** The product is fixed by `MISSION.md`; there is no
+   idea-generation workflow in this configuration. `research-thompson` is re-scoped to
+   research *within* the locked mission (competitor behaviour, prior art, API choices).
 
 ## Documentation Map
 
@@ -125,14 +131,23 @@ Key authenticated tools:
 
 | Tool | Status | Purpose |
 |------|------|------|
-| `gh` | Available | Full GitHub operations: repos, issues, PRs, releases |
-| `wrangler` | Available | Cloudflare operations: Workers/Pages/KV/D1/R2 |
-| `git` | Available | Version control |
-| `node`/`npm`/`npx` | Available | Node runtime and package management |
+| `go` | Available | **Primary backend stack.** Build, vet and test the product |
+| `git` | Available | Local version control only. `push`, `remote` and `reset` are blocked |
+| `node`/`npm`/`npx` | Available | Frontend build and package management |
 | `uv`/`python` | Available | Python runtime and package management |
-| `curl`/`jq` | Available | HTTP + JSON processing |
+| `curl`/`jq` | Available | HTTP + JSON processing (local endpoints; egress is allowlisted) |
+| `gh` | **Blocked** | Not installed and denied. This run never touches GitHub |
+| `wrangler` | **Blocked** | Not installed and denied. No Cloudflare deployment in this run |
 
-Need other tools? Install directly with `npm install -g`, `uv tool install`, or `brew install`.
+This run is **local-only**. The product is built and tested on this machine; deployment is
+a later, human-driven step. Do not attempt to install `gh` or `wrangler`, and do not design
+around Cloudflare Workers — `projects/snapog/` is a leftover from an unrelated earlier run
+and is not a template.
+
+Go dependencies work differently here: the sandbox blocks the Go toolchain from the module
+proxy, so builds run with `GOPROXY=off`. `go get` will fail by design. To add a dependency,
+write the `import` statement; the supervisor runs `go mod tidy` between cycles and the
+module is available on the next one.
 
 ## Skills Arsenal
 

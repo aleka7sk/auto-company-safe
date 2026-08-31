@@ -179,6 +179,22 @@ cat > "$PLIST_PATH" << EOF
         <string>${CODEX_BIN}</string>
         <key>CODEX_SANDBOX_MODE</key>
         <string>${CODEX_SANDBOX_MODE}</string>
+        <key>MAX_CYCLES</key>
+        <string>${MAX_CYCLES:-40}</string>
+        <key>MAX_RUNTIME_SECONDS</key>
+        <string>${MAX_RUNTIME_SECONDS:-28800}</string>
+        <key>STOP_AFTER_CRITERIA</key>
+        <string>${STOP_AFTER_CRITERIA:-0}</string>
+        <key>REQUIRED_COMPLETE_STREAK</key>
+        <string>${REQUIRED_COMPLETE_STREAK:-2}</string>
+        <key>STOP_ON_BLOCKED</key>
+        <string>${STOP_ON_BLOCKED:-2}</string>
+        <key>MAX_LIMIT_WAITS</key>
+        <string>${MAX_LIMIT_WAITS:-6}</string>
+        <key>LOOP_INTERVAL</key>
+        <string>${LOOP_INTERVAL:-30}</string>
+        <key>CYCLE_TIMEOUT_SECONDS</key>
+        <string>${CYCLE_TIMEOUT_SECONDS:-1800}</string>
     </dict>
 
     <key>ThrottleInterval</key>

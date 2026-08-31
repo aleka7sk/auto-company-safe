@@ -41,6 +41,8 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 LOG_DIR="$PROJECT_DIR/logs"
 CONSENSUS_FILE="$PROJECT_DIR/memories/consensus.md"
 PROMPT_FILE="$PROJECT_DIR/PROMPT.md"
+MISSION_FILE="$PROJECT_DIR/MISSION.md"
+LOOP_SETTINGS_FILE="$PROJECT_DIR/loop-settings.json"
 PID_FILE="$PROJECT_DIR/.auto-loop.pid"
 STATE_FILE="$PROJECT_DIR/.auto-loop-state"
 
@@ -60,7 +62,27 @@ COOLDOWN_SECONDS="${COOLDOWN_SECONDS:-300}"
 LIMIT_WAIT_SECONDS="${LIMIT_WAIT_SECONDS:-3600}"
 MAX_LOGS="${MAX_LOGS:-200}"
 AUTO_LOOP_PROTECT_GITIGNORE="${AUTO_LOOP_PROTECT_GITIGNORE:-1}"
+AUTO_LOOP_PROTECT_MISSION="${AUTO_LOOP_PROTECT_MISSION:-1}"
+# Termination. MAX_CYCLES and MAX_RUNTIME_SECONDS are the backstops that make an
+# unattended run bounded; without them a model that never declares COMPLETE drains the
+# subscription quota indefinitely. Set either to 0 to disable.
+MAX_CYCLES="${MAX_CYCLES:-40}"
+MAX_RUNTIME_SECONDS="${MAX_RUNTIME_SECONDS:-28800}"
+STOP_AFTER_CRITERIA="${STOP_AFTER_CRITERIA:-0}"
+REQUIRED_COMPLETE_STREAK="${REQUIRED_COMPLETE_STREAK:-2}"
+STOP_ON_BLOCKED="${STOP_ON_BLOCKED:-2}"
+MAX_LIMIT_WAITS="${MAX_LIMIT_WAITS:-6}"
 RESOLVED_ENGINE_BIN=""
+complete_streak=0
+blocked_streak=0
+limit_waits=0
+START_EPOCH="$(date +%s)"
+# Pre-declared because `set -u` is active and the prompt builder reads them.
+MISSION_PRODUCT=""
+MISSION_SLUG=""
+protected_snapshot=""
+STOP_REASON=""
+ENGINE_PID=""
 
 if [ "$ENGINE" != "claude" ] && [ "$ENGINE" != "codex" ]; then
     echo "Error: ENGINE must be 'claude' or 'codex' (received: '$ENGINE')."
@@ -69,6 +91,32 @@ fi
 
 # Keep Agent Teams compatibility for legacy prompts/config.
 export CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1
+
+# Go toolchain, scoped to this loop only (the user's global `go env` is untouched).
+#
+# Caches are routed into the project because both defaults (~/go/pkg/mod and
+# ~/Library/Caches/go-build) sit outside it, and the sandbox only grants write
+# inside the project — `go build` would otherwise fail on the cache write.
+#
+# GOPROXY=off is deliberate and is inherited by the sandboxed agent. Measured
+# behaviour on Claude Code 2.1.251: curl reaches proxy.golang.org through the
+# sandbox proxy fine (HTTP 200), but the Go toolchain fails the same fetch with
+# `tls: failed to verify certificate: x509: OSStatus -26276`, because it does not
+# get through the proxy's authenticated CONNECT the way curl and git do. Rather
+# than punching a hole in the sandbox for Go, the supervisor — which is a plain
+# bash script and is NOT sandboxed — warms the module cache between cycles (see
+# warm_go_module_cache). The agent then builds strictly offline.
+#
+# This is stricter than the original design: the agent can no longer fetch Go
+# modules at all; only the supervisor can, and only what is already in go.mod.
+export GOFLAGS="${GOFLAGS:--mod=mod}"
+export GOPROXY="off"
+export GOSUMDB="sum.golang.org"
+export GOMODCACHE="$PROJECT_DIR/.gocache/mod"
+export GOCACHE="$PROJECT_DIR/.gocache/build"
+
+# Proxy used only by the supervisor's own cache warming, never exported to the agent.
+GO_FETCH_PROXY="${GO_FETCH_PROXY:-https://proxy.golang.org,direct}"
 
 # === Functions ===
 
@@ -111,6 +159,9 @@ check_stop_requested() {
 }
 
 save_state() {
+    # The dashboard parses this as KEY=VALUE and ignores keys it does not know, so extra
+    # keys are safe. MISSION_PRODUCT is here so `make status` answers the question that
+    # actually matters at a glance: is it still building my product?
     cat > "$STATE_FILE" << EOF
 LOOP_COUNT=$loop_count
 ERROR_COUNT=$error_count
@@ -118,11 +169,37 @@ LAST_RUN=$(date '+%Y-%m-%d %H:%M:%S')
 STATUS=$1
 MODEL=$MODEL_LABEL
 ENGINE=$ENGINE
+MISSION_PRODUCT=$MISSION_PRODUCT
+COMPLETION_STATUS=$(read_completion_status)
+CRITERIA=$(criteria_checked)/$(criteria_total)
+STOP_REASON=${STOP_REASON:-}
+START_EPOCH=$START_EPOCH
 EOF
+}
+
+kill_engine_child() {
+    # `make stop` SIGTERMs the supervisor. Without this the headless engine keeps running
+    # and keeps writing files after the user believes the loop has stopped.
+    [ -n "${ENGINE_PID:-}" ] || return 0
+    if kill -0 "$ENGINE_PID" 2>/dev/null; then
+        log "Stopping in-flight engine process $ENGINE_PID"
+        pkill -P "$ENGINE_PID" 2>/dev/null || true
+        kill -TERM "$ENGINE_PID" 2>/dev/null || true
+        sleep 2
+        pkill -9 -P "$ENGINE_PID" 2>/dev/null || true
+        kill -KILL "$ENGINE_PID" 2>/dev/null || true
+    fi
+    ENGINE_PID=""
 }
 
 cleanup() {
     log "=== Auto Loop Shutting Down (PID $$) ==="
+    kill_engine_child
+    # First, before anything records state: a stop that lands mid-cycle must not leave
+    # a mutated MISSION.md on disk. Otherwise the next start would read the model's
+    # rewrite as the mission, and the lock would break at exactly the moment the
+    # founder intervened.
+    restore_protected_files_if_changed "${protected_snapshot:-}"
     rm -f "$PID_FILE"
     save_state "stopped"
     exit 0
@@ -176,6 +253,64 @@ restore_gitignore_if_changed() {
     fi
 
     [ -n "$snapshot_file" ] && rm -f "$snapshot_file"
+}
+
+# Founder-owned files. A cycle must never change these; loop-settings.json denies the
+# edit up front, and this reverts anything that slips past (a shell redirect, a script
+# the agent generated, a tool the deny rules do not cover).
+PROTECTED_FILES="MISSION.md CLAUDE.md .gitignore loop-settings.json"
+
+snapshot_protected_files() {
+    [ "$AUTO_LOOP_PROTECT_MISSION" = "1" ] || return 0
+    local dir rel
+    dir="$(mktemp -d "${TMPDIR:-/tmp}/auto-loop-protect.XXXXXX")" || return 0
+    for rel in $PROTECTED_FILES; do
+        [ -f "$PROJECT_DIR/$rel" ] && cp "$PROJECT_DIR/$rel" "$dir/$(echo "$rel" | tr '/' '_')" 2>/dev/null || true
+    done
+    echo "$dir"
+}
+
+restore_protected_files_if_changed() {
+    local dir="${1:-}"
+    [ -n "$dir" ] && [ -d "$dir" ] || return 0
+    local rel snap
+    for rel in $PROTECTED_FILES; do
+        snap="$dir/$(echo "$rel" | tr '/' '_')"
+        [ -f "$snap" ] || continue
+        if ! cmp -s "$snap" "$PROJECT_DIR/$rel" 2>/dev/null; then
+            cp "$snap" "$PROJECT_DIR/$rel" 2>/dev/null || true
+            log_cycle "${loop_count:-0}" "GUARD" "Reverted cycle modification of $rel"
+        fi
+    done
+    rm -rf "$dir" 2>/dev/null || true
+}
+
+warm_go_module_cache() {
+    # Runs in the supervisor, which is NOT sandboxed, so it can reach the module
+    # proxy that the sandboxed agent cannot. Downloads only what the agent already
+    # declared in go.mod; it never resolves anything the agent did not write down.
+    # A cycle that adds a dependency fails to build, this warms the cache, and the
+    # next cycle builds — self-healing with a one-cycle lag.
+    command -v go >/dev/null 2>&1 || return 0
+    [ -d "$PROJECT_DIR/projects" ] || return 0
+
+    local mod_file module_dir warmed=0
+    while IFS= read -r mod_file; do
+        module_dir="$(dirname "$mod_file")"
+        # `go mod tidy` first so an agent only has to write the import statement:
+        # it resolves imports from source into go.mod/go.sum. `download all` then
+        # fills the cache so the next sandboxed cycle builds offline.
+        if (cd "$module_dir" \
+                && GOPROXY="$GO_FETCH_PROXY" GOFLAGS="-mod=mod" go mod tidy >/dev/null 2>&1 \
+                && GOPROXY="$GO_FETCH_PROXY" GOFLAGS="-mod=mod" go mod download all >/dev/null 2>&1); then
+            warmed=$((warmed + 1))
+        else
+            log_cycle "$loop_count" "GOWARM" "go mod download failed in ${module_dir#$PROJECT_DIR/}"
+        fi
+    done < <(find "$PROJECT_DIR/projects" -maxdepth 3 -name go.mod -not -path '*/.gocache/*' 2>/dev/null)
+
+    [ "$warmed" -gt 0 ] && log_cycle "$loop_count" "GOWARM" "Warmed Go module cache for $warmed module(s)"
+    return 0
 }
 
 get_file_size_bytes() {
@@ -248,11 +383,70 @@ backup_consensus() {
     fi
 }
 
+seed_consensus() {
+    # Generate a contract-valid baseline from MISSION.md. Called whenever the consensus
+    # does not satisfy validate_consensus, at startup and as the last resort on restore.
+    mkdir -p "$(dirname "$CONSENSUS_FILE")"
+    {
+        echo "# Auto Company Consensus"
+        echo
+        echo "## Last Updated"
+        date '+%Y-%m-%d %H:%M:%S'
+        echo
+        echo "## Current Phase"
+        echo "Building"
+        echo
+        echo "## What We Did This Cycle"
+        echo "- (seed) Loop initialised under mission lock."
+        echo
+        echo "## Key Decisions Made"
+        echo "- Product is fixed by MISSION.md. No idea selection in this run."
+        echo
+        echo "## Active Projects"
+        echo "- $MISSION_PRODUCT: not started - scaffold under projects/$MISSION_SLUG"
+        echo
+        echo "## Acceptance Criteria"
+        sed -n '/^## Definition of Done/,$p' "$MISSION_FILE" \
+            | grep -E '^- \[[ xX]\]' \
+            | sed 's/^- \[[xX]\]/- [ ]/' \
+            || echo "- [ ] (copy from MISSION.md Definition of Done)"
+        echo
+        echo "## Completion Status"
+        echo "IN_PROGRESS"
+        echo
+        echo "## Completion Evidence"
+        echo "(none yet)"
+        echo
+        echo "## Next Action"
+        echo "Scaffold projects/$MISSION_SLUG and deliver the first unchecked acceptance criterion."
+        echo
+        echo "## Company State"
+        echo "- Product: $MISSION_PRODUCT"
+        echo "- Tech Stack: Go"
+        echo "- Revenue: \$0"
+        echo "- Users: 0"
+        echo
+        echo "## Open Questions"
+        echo "- (none yet)"
+    } > "$CONSENSUS_FILE"
+}
+
 restore_consensus() {
+    # Never restore a backup that is itself invalid. Doing so creates a loop that looks
+    # like work but produces nothing: the file fails validation at both ends of every
+    # cycle, each cycle is marked FAIL, the breaker sleeps and resets, and the run burns
+    # quota forever. Re-seed instead.
     if [ -f "$CONSENSUS_FILE.bak" ]; then
         cp "$CONSENSUS_FILE.bak" "$CONSENSUS_FILE"
-        log "Consensus restored from backup after failed cycle"
+        if validate_consensus; then
+            log "Consensus restored from backup after failed cycle"
+            return 0
+        fi
+        log "Backup consensus is also invalid - re-seeding from MISSION.md"
+    else
+        log "No consensus backup - seeding from MISSION.md"
     fi
+    seed_consensus
 }
 
 validate_consensus() {
@@ -268,7 +462,97 @@ validate_consensus() {
     if ! grep -q "^## Company State" "$CONSENSUS_FILE"; then
         return 1
     fi
+    # Added by the mission lock: completion detection reads both of these, and a cycle
+    # that drops them would leave the run with no way to ever finish.
+    if ! grep -q "^## Acceptance Criteria" "$CONSENSUS_FILE"; then
+        return 1
+    fi
+    if ! grep -q "^## Completion Status" "$CONSENSUS_FILE"; then
+        return 1
+    fi
     return 0
+}
+
+read_completion_status() {
+    sed -n '/^## Completion Status/,/^## /p' "$CONSENSUS_FILE" 2>/dev/null \
+        | grep -Ev '^## ' | grep -Eo 'IN_PROGRESS|BLOCKED|COMPLETE' | head -1
+}
+
+criteria_total() {
+    sed -n '/^## Acceptance Criteria/,/^## /p' "$CONSENSUS_FILE" 2>/dev/null | grep -cE '^- \[[ xX]\]'
+}
+
+criteria_checked() {
+    sed -n '/^## Acceptance Criteria/,/^## /p' "$CONSENSUS_FILE" 2>/dev/null | grep -cE '^- \[[xX]\]'
+}
+
+completion_evidence_present() {
+    # Require the model to paste something that looks like real command output. This is a
+    # weak check by nature - it raises the cost of lying, it does not make lying impossible.
+    local body
+    body=$(sed -n '/^## Completion Evidence/,/^## /p' "$CONSENSUS_FILE" 2>/dev/null | grep -Ev '^## ')
+    printf '%s' "$body" | grep -qE 'go (build|test|vet)'
+}
+
+completion_accepted() {
+    # COMPLETE counts only when every criterion is ticked, there is at least one criterion,
+    # and evidence is present. The caller additionally requires the condition to survive
+    # REQUIRED_COMPLETE_STREAK consecutive cycles, each a fresh session.
+    local total checked
+    total=$(criteria_total)
+    checked=$(criteria_checked)
+    [ "$total" -gt 0 ] || return 1
+    [ "$checked" -eq "$total" ] || return 1
+    completion_evidence_present || return 1
+    return 0
+}
+
+freeze_state() {
+    local reason="$1"
+    local stamp freeze_dir
+    stamp="$(date '+%Y%m%d-%H%M%S')"
+    freeze_dir="$PROJECT_DIR/memories/freeze/${stamp}-${reason}"
+    mkdir -p "$freeze_dir" 2>/dev/null || return 0
+    cp "$CONSENSUS_FILE" "$freeze_dir/consensus.md" 2>/dev/null || true
+    cp "$STATE_FILE" "$freeze_dir/auto-loop-state" 2>/dev/null || true
+    cp "$MISSION_FILE" "$freeze_dir/MISSION.md" 2>/dev/null || true
+    ls -1t "$LOG_DIR"/cycle-*.log 2>/dev/null | head -1 | while read -r last_log; do
+        cp "$last_log" "$freeze_dir/last-cycle.log" 2>/dev/null || true
+    done
+    {
+        echo "# Run Freeze"
+        echo
+        echo "- Reason: $reason"
+        echo "- Product: $MISSION_PRODUCT"
+        echo "- Cycles completed: ${loop_count:-0}"
+        echo "- Runtime: $(( $(date +%s) - START_EPOCH ))s"
+        echo "- Criteria: $(criteria_checked)/$(criteria_total) checked"
+        echo "- Completion status: $(read_completion_status)"
+        echo
+        echo "Resume with: rm -f .auto-loop-paused && make start"
+        if [ "$reason" = "completed" ]; then
+            echo "This run finished. Starting again requires RESET_RUN=1."
+        fi
+    } > "$freeze_dir/SUMMARY.md" 2>/dev/null || true
+    echo "$freeze_dir"
+}
+
+terminal_stop() {
+    local reason="$1" detail="$2"
+    log_cycle "${loop_count:-0}" "STOP" "$detail"
+    kill_engine_child
+    restore_protected_files_if_changed "${protected_snapshot:-}"
+    local freeze_dir
+    freeze_dir="$(freeze_state "$reason")"
+    [ -n "$freeze_dir" ] && log "Frozen state written to ${freeze_dir#$PROJECT_DIR/}"
+    # Without this flag launchd's KeepAlive respawns the loop within 30s and the "stop"
+    # is fiction. stop-loop.sh --pause-daemon relies on the same marker.
+    touch "$PROJECT_DIR/.auto-loop-paused"
+    STOP_REASON="$reason"
+    save_state "$reason"
+    log "=== Auto Loop Finished: $reason ==="
+    rm -f "$PID_FILE"
+    exit 0
 }
 
 consensus_changed_since_backup() {
@@ -445,6 +729,10 @@ run_claude_cycle() {
     (
         cd "$PROJECT_DIR" || exit 1
         local claude_cmd=("$RESOLVED_ENGINE_BIN" "-p" "$prompt" "--output-format" "json")
+        # Sandbox, deny rules and the Bash guard hook live here rather than in
+        # .claude/settings.json so they bind the unattended loop without also
+        # binding interactive sessions in this repo.
+        claude_cmd+=("--settings" "$LOOP_SETTINGS_FILE")
         if [ -n "$MODEL" ]; then
             claude_cmd+=("--model" "$MODEL")
         fi
@@ -454,6 +742,7 @@ run_claude_cycle() {
         "${claude_cmd[@]}"
     ) > "$output_file" 2>&1 &
     local claude_pid=$!
+    ENGINE_PID="$claude_pid"
 
     (
         sleep "$CYCLE_TIMEOUT_SECONDS"
@@ -588,6 +877,85 @@ if [ ! -f "$PROMPT_FILE" ]; then
     exit 1
 fi
 
+# Mission lock. Fail fast rather than falling back to legacy behaviour: a missing or
+# unfilled brief must never silently resume "pick your own product" mode.
+if [ ! -f "$MISSION_FILE" ]; then
+    echo "Error: MISSION.md not found at $MISSION_FILE"
+    echo "This loop is mission-locked and will not choose a product for itself."
+    exit 1
+fi
+
+MISSION_PRODUCT="$(grep -m1 '^\*\*Product:\*\*' "$MISSION_FILE" | sed 's/^\*\*Product:\*\* *//' | tr -d '\r' || true)"
+if [ -z "$MISSION_PRODUCT" ] || [ "$MISSION_PRODUCT" = "TBD" ]; then
+    echo "Error: MISSION.md has no product yet."
+    echo "Set a real name on the '**Product:** ...' line and fill in Definition of Done."
+    exit 1
+fi
+
+if ! grep -q '^## Definition of Done' "$MISSION_FILE"; then
+    echo "Error: MISSION.md is missing the '## Definition of Done' section."
+    echo "Without it the loop has no completion criteria and could never finish."
+    exit 1
+fi
+
+MISSION_SLUG="$(echo "$MISSION_PRODUCT" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]\{1,\}/-/g; s/^-//; s/-$//')"
+
+check_single_product() {
+    # Warn if a directory appears under projects/ that is neither the mission's own nor
+    # the known leftover. Cheap early signal that the team started a second product.
+    [ -d "$PROJECT_DIR/projects" ] || return 0
+    local entry name
+    for entry in "$PROJECT_DIR/projects"/*/; do
+        [ -d "$entry" ] || continue
+        name="$(basename "$entry")"
+        case "$name" in
+            "$MISSION_SLUG"|snapog) ;;
+            *) log_cycle "${loop_count:-0}" "GUARD" "Unexpected project directory 'projects/$name' - mission is '$MISSION_SLUG'" ;;
+        esac
+    done
+    return 0
+}
+
+# Refuse to run unguarded. These two files are the entire enforcement layer;
+# if either is missing the loop would still work, which is exactly the failure
+# we must never have — an autonomous run that silently lost its sandbox.
+if [ "$ENGINE" = "claude" ] && [ ! -f "$LOOP_SETTINGS_FILE" ]; then
+    echo "Error: loop-settings.json not found at $LOOP_SETTINGS_FILE"
+    echo "It carries the sandbox, deny rules and Bash guard hook. Refusing to run unguarded."
+    exit 1
+fi
+
+if [ ! -x "$PROJECT_DIR/scripts/core/guard-bash.sh" ]; then
+    echo "Error: scripts/core/guard-bash.sh is missing or not executable."
+    echo "The PreToolUse guard would silently not run. Fix with: chmod +x scripts/core/guard-bash.sh"
+    exit 1
+fi
+
+# A completed run must not silently restart: the consensus still says COMPLETE with every
+# box ticked, so the loop would accept it, "confirm" it and stop again having built nothing.
+if [ -f "$STATE_FILE" ] && grep -q '^STOP_REASON=completed' "$STATE_FILE" 2>/dev/null; then
+    if [ "${RESET_RUN:-0}" != "1" ]; then
+        echo "This run already finished (STOP_REASON=completed)."
+        echo "Inspect memories/freeze/ first. To start a fresh run: RESET_RUN=1 make start"
+        exit 1
+    fi
+    echo "RESET_RUN=1: clearing consensus and starting a fresh run."
+    rm -f "$CONSENSUS_FILE" "$CONSENSUS_FILE.bak"
+fi
+
+# Seed or repair the consensus so cycle 1 starts from a contract-valid baseline. Without
+# this, a consensus that fails the tightened validation is copied to .bak and restored
+# from .bak every cycle, and the run fails forever while looking busy.
+if ! validate_consensus; then
+    seed_consensus
+    echo "Seeded memories/consensus.md from MISSION.md"
+fi
+
+if [ -f "$PROJECT_DIR/.auto-loop-paused" ]; then
+    echo "Note: .auto-loop-paused exists; removing it so this foreground run proceeds."
+    rm -f "$PROJECT_DIR/.auto-loop-paused"
+fi
+
 # Write PID file
 echo $$ > "$PID_FILE"
 
@@ -634,6 +1002,18 @@ while true; do
         cleanup
     fi
 
+    # Backstops, checked before starting work so a run can overshoot by at most the
+    # cycle already in flight. Set the caps slightly below the true ceiling.
+    if [ "$MAX_CYCLES" -gt 0 ] && [ "$loop_count" -ge "$MAX_CYCLES" ]; then
+        terminal_stop "stopped_cap" "Reached MAX_CYCLES=$MAX_CYCLES"
+    fi
+    if [ "$MAX_RUNTIME_SECONDS" -gt 0 ]; then
+        elapsed=$(( $(date +%s) - START_EPOCH ))
+        if [ "$elapsed" -ge "$MAX_RUNTIME_SECONDS" ]; then
+            terminal_stop "stopped_cap" "Reached MAX_RUNTIME_SECONDS=$MAX_RUNTIME_SECONDS (ran ${elapsed}s)"
+        fi
+    fi
+
     loop_count=$((loop_count + 1))
     cycle_log="$LOG_DIR/cycle-$(printf '%04d' "$loop_count")-$(date '+%Y%m%d-%H%M%S').log"
 
@@ -646,11 +1026,39 @@ while true; do
     # Backup consensus before cycle
     backup_consensus
     gitignore_snapshot=$(snapshot_gitignore)
+    protected_snapshot=$(snapshot_protected_files)
 
-    # Build prompt with consensus pre-injected
+    # Build prompt: mission lock first, then guardrails, then the legacy cycle prompt.
+    # Order matters. Bash does not re-scan the result of a parameter expansion, so a
+    # MISSION.md containing $, backticks or backslashes is inserted literally and safely.
     PROMPT=$(cat "$PROMPT_FILE")
+    MISSION=$(cat "$MISSION_FILE")
     CONSENSUS=$(cat "$CONSENSUS_FILE" 2>/dev/null || echo "No consensus file found. This is the very first cycle.")
-    FULL_PROMPT="$PROMPT
+    FULL_PROMPT="## MISSION LOCK — highest priority, overrides everything below
+
+You are building exactly one product: **$MISSION_PRODUCT**. It is already chosen. Do not
+brainstorm alternatives, do not evaluate other ideas, do not pivot, and do not start a
+second product. If a rule further down this prompt tells you to generate ideas, rank
+options, run a GO/NO-GO, or change direction, that rule is superseded — ignore it and
+advance this mission instead. If you are stuck, narrow the current task; never change
+the product.
+
+The full brief follows. It is read-only: any edit you make to MISSION.md is reverted.
+
+$MISSION
+
+---
+
+## Hard Safety Rules (enforced outside this prompt as well)
+
+- Never run \`gh\`, \`wrangler\`, \`git push\`, \`git remote\`, \`git reset\`, \`sudo\`, or \`launchctl\`.
+  This run is local-only; those are blocked and attempts are logged.
+- Never read or write \`~/.ssh\`, \`~/.aws\`, \`~/.claude\`, or any \`.env\` file.
+- Never edit MISSION.md, CLAUDE.md, .gitignore, loop-settings.json, or anything under
+  .claude/, .github/, scripts/, dashboard/, or tests/. Those are founder-owned.
+- Build the product only under \`projects/\`. Never create files outside this repository.
+- \`go get\` does not work here by design (\`GOPROXY=off\`). To add a dependency, write the
+  \`import\` statement and move on; the supervisor resolves it before the next cycle.
 
 ---
 
@@ -672,6 +1080,20 @@ $CONSENSUS
 
 This is Cycle #$loop_count. Act decisively."
 
+    # Verify the mission actually made it into the prompt. If an edit to the block above
+    # ever breaks the expansion, the failure is otherwise silent: the model simply never
+    # sees the mission and wanders off, which is the exact outcome this design prevents.
+    if ! printf '%s' "$FULL_PROMPT" | grep -Fq "$MISSION_PRODUCT"; then
+        log_cycle "$loop_count" "FAIL" "Mission missing from built prompt - refusing to run cycle"
+        save_state "stopped"
+        cleanup
+    fi
+
+    prompt_bytes=$(printf '%s' "$FULL_PROMPT" | wc -c | tr -d ' ')
+    if [ "$prompt_bytes" -gt 800000 ]; then
+        log_cycle "$loop_count" "WARN" "Prompt is ${prompt_bytes} bytes, approaching ARG_MAX; trim memories/consensus.md"
+    fi
+
     # Run selected engine in headless mode with per-cycle timeout
     run_engine_cycle "$FULL_PROMPT"
 
@@ -681,6 +1103,10 @@ This is Cycle #$loop_count. Act decisively."
     # Clean up known malformed-redirection artifacts created by bad generated shell commands.
     cleanup_accidental_root_artifacts
     restore_gitignore_if_changed "$gitignore_snapshot"
+    restore_protected_files_if_changed "$protected_snapshot"
+    protected_snapshot=""
+    check_single_product
+    warm_go_module_cache
 
     # Extract result fields for status classification
     extract_cycle_metadata
@@ -720,7 +1146,11 @@ This is Cycle #$loop_count. Act decisively."
 
         # Check for usage limit
         if check_usage_limit "$OUTPUT"; then
-            log_cycle "$loop_count" "LIMIT" "API usage limit detected. Waiting ${LIMIT_WAIT_SECONDS}s..."
+            limit_waits=$((limit_waits + 1))
+            if [ "$MAX_LIMIT_WAITS" -gt 0 ] && [ "$limit_waits" -gt "$MAX_LIMIT_WAITS" ]; then
+                terminal_stop "stopped_cap" "Hit the usage limit $limit_waits times - giving up instead of waiting again"
+            fi
+            log_cycle "$loop_count" "LIMIT" "API usage limit detected. Waiting ${LIMIT_WAIT_SECONDS}s (${limit_waits}/${MAX_LIMIT_WAITS})..."
             save_state "waiting_limit"
             sleep "$LIMIT_WAIT_SECONDS"
             error_count=0
@@ -734,6 +1164,41 @@ This is Cycle #$loop_count. Act decisively."
             sleep "$COOLDOWN_SECONDS"
             error_count=0
             log "Circuit breaker reset. Resuming..."
+        fi
+    fi
+
+    # Completion detection. Runs only on a cycle that succeeded, so the consensus has
+    # already passed validate_consensus and the sections below are known to exist.
+    if [ -z "$cycle_failed_reason" ]; then
+        cycle_status="$(read_completion_status)"
+
+        if [ "$cycle_status" = "COMPLETE" ] && completion_accepted; then
+            complete_streak=$((complete_streak + 1))
+            log_cycle "$loop_count" "DONE?" "COMPLETE claimed and criteria verified ($complete_streak/$REQUIRED_COMPLETE_STREAK)"
+            if [ "$complete_streak" -ge "$REQUIRED_COMPLETE_STREAK" ]; then
+                terminal_stop "completed" "Product complete: $(criteria_checked)/$(criteria_total) criteria, confirmed $complete_streak cycles running"
+            fi
+        else
+            if [ "$cycle_status" = "COMPLETE" ]; then
+                # Claimed done without meeting the bar. Say so loudly; the next cycle sees
+                # the unchecked boxes and keeps working.
+                log_cycle "$loop_count" "REJECT" "COMPLETE rejected: $(criteria_checked)/$(criteria_total) criteria checked, evidence $(completion_evidence_present && echo present || echo missing)"
+            fi
+            complete_streak=0
+        fi
+
+        if [ "$cycle_status" = "BLOCKED" ]; then
+            blocked_streak=$((blocked_streak + 1))
+            log_cycle "$loop_count" "BLOCKED" "Team reports blocked ($blocked_streak/$STOP_ON_BLOCKED)"
+            if [ "$STOP_ON_BLOCKED" -gt 0 ] && [ "$blocked_streak" -ge "$STOP_ON_BLOCKED" ]; then
+                terminal_stop "blocked" "Blocked for $blocked_streak consecutive cycles - needs a human"
+            fi
+        else
+            blocked_streak=0
+        fi
+
+        if [ "$STOP_AFTER_CRITERIA" -gt 0 ] && [ "$(criteria_checked)" -ge "$STOP_AFTER_CRITERIA" ]; then
+            terminal_stop "stopped_cap" "Reached STOP_AFTER_CRITERIA=$STOP_AFTER_CRITERIA ($(criteria_checked) checked)"
         fi
     fi
 

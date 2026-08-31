@@ -243,18 +243,40 @@ Hard constraints in `CLAUDE.md`, enforced for all agents:
 
 Environment variable overrides:
 
+> **This fork is mission-locked.** The loop builds the single product described in
+> `MISSION.md` and stops on its own when the Definition of Done is met. See
+> [`docs/mission-runbook.md`](docs/mission-runbook.md) before the first run.
+
 ```bash
-ENGINE=claude make start                   # Default engine (claude|codex)
-ENGINE=codex make start                    # Switch to codex
+# Termination — these are what make an unattended run bounded
+MAX_CYCLES=40 make start                   # Hard cycle cap (0 = unlimited, default 40)
+MAX_RUNTIME_SECONDS=28800 make start       # Wall-clock cap (0 = unlimited, default 8h)
+REQUIRED_COMPLETE_STREAK=2 make start      # Consecutive cycles that must confirm COMPLETE
+STOP_ON_BLOCKED=2 make start               # Consecutive BLOCKED cycles before stopping
+STOP_AFTER_CRITERIA=3 make start           # Stop once N acceptance criteria are checked
+MAX_LIMIT_WAITS=6 make start               # Give up after N usage-limit waits
+RESET_RUN=1 make start                     # Start over after a finished run
+
+# Engine
+ENGINE=claude make start                   # Engine (codex is unsupported in this fork)
 MODEL=sonnet make start                    # Optional model override
-CLAUDE_PERMISSION_MODE=bypassPermissions make start  # Claude permission mode
 LOOP_INTERVAL=60 make start                # 60s interval (default 30)
 CYCLE_TIMEOUT_SECONDS=3600 make start      # 1h cycle timeout (default 1800)
 MAX_CONSECUTIVE_ERRORS=3 make start        # Circuit-breaker threshold (default 5)
-CODEX_SANDBOX_MODE=workspace-write make start  # Optional sandbox override
 CLAUDE_BIN=/usr/local/bin/claude make start     # Optional Claude binary override
-CODEX_BIN=/usr/local/bin/codex make start       # Optional Codex binary override
+
+# Guards
+AUTO_LOOP_PROTECT_MISSION=0 make start     # Disable the founder-file revert (not advised)
+AUTO_LOOP_PROTECT_GITIGNORE=0 make start   # Disable the .gitignore revert
+COOLDOWN_SECONDS=300 make start            # Sleep after the breaker trips
+LIMIT_WAIT_SECONDS=3600 make start         # Sleep on a usage limit
+MAX_LOGS=200 make start                    # Cycle logs to keep
 ```
+
+Sandbox, deny rules and the Bash guard hook live in `loop-settings.json`, which the loop
+passes to the engine with `--settings`. They apply to the autonomous run only, so
+interactive sessions in this repo are unaffected. The loop refuses to start if that file
+or `scripts/core/guard-bash.sh` is missing.
 
 Windows `start-win.ps1` writes the same values into `.auto-loop.env`:
 

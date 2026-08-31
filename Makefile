@@ -1,4 +1,4 @@
-.PHONY: start start-awake awake stop status last cycles monitor dashboard pause resume install uninstall team help
+.PHONY: start start-awake awake stop status last cycles monitor dashboard pause resume install uninstall team help test clean-logs reset-consensus freeze-status
 
 UNAME_S := $(shell uname -s 2>/dev/null || echo Unknown)
 ENGINE ?= claude
@@ -95,15 +95,22 @@ team: ## Start selected engine interactive session (ENGINE=claude|codex)
 
 # === Maintenance ===
 
+test: ## Run the offline test suite (no network, no quota spent)
+	python3 -m unittest discover tests
+
+freeze-status: ## Show the most recent run freeze summary
+	@latest=$$(ls -1dt memories/freeze/*/ 2>/dev/null | head -1); \
+	if [ -z "$$latest" ]; then echo "No freeze records yet."; else cat "$$latest/SUMMARY.md"; fi
+
 clean-logs: ## Remove all cycle logs
 	rm -f logs/cycle-*.log logs/auto-loop.log.old
 	@echo "Cycle logs cleaned."
 
-reset-consensus: ## Reset consensus to initial Day 0 state (CAUTION)
-	@echo "This will reset all company progress. Ctrl+C to cancel."
+reset-consensus: ## Reset consensus so the next start re-seeds it from MISSION.md (CAUTION)
+	@echo "This will discard the current consensus. Ctrl+C to cancel."
 	@sleep 3
-	git checkout -- memories/consensus.md
-	@echo "Consensus reset to initial state."
+	rm -f memories/consensus.md memories/consensus.md.bak
+	@echo "Consensus cleared. The next 'make start' seeds a fresh one from MISSION.md."
 
 # === Help ===
 

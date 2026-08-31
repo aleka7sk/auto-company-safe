@@ -1,12 +1,20 @@
 {
+  "$comment": [
+    "Interactive sessions in this repo. The autonomous loop does NOT rely on this file:",
+    "scripts/core/auto-loop.sh passes loop-settings.json via --settings, which carries the",
+    "sandbox, deny rules and the Bash guard hook.",
+    "The upstream 'allow' list was removed: allow rules have no effect under bypassPermissions,",
+    "so it granted nothing while looking like it did.",
+    "enableAllProjectMcpServers is false so that trusting this workspace never auto-starts an",
+    "MCP server a future upstream merge might add."
+  ],
   "permissions": {
     "defaultMode": "bypassPermissions",
-    "allow": ["WebSearch", "Bash", "Edit", "Write", "WebFetch", "NotebookEdit", "Skill"],
     "ask": [],
     "deny": []
   },
   "env": {
     "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"
   },
-  "enableAllProjectMcpServers": true
+  "enableAllProjectMcpServers": false
 }

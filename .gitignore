@@ -142,6 +142,9 @@ logs/
 .auto-loop-wsl-anchor.stop
 memories/consensus.md.bak
 
+# Go build/module cache, redirected into the project so the sandbox can write it
+.gocache/
+
 # Projects directory (show folder on GitHub, hide contents)
 projects/*
 !projects/.gitkeep
@@ -183,6 +186,7 @@ docs/*
 docs/*/*
 !docs/*/.gitkeep
 !docs/windows-setup.md
+!docs/mission-runbook.md
 # Ignore all memories (keep folder marker only)
 memories/*
 !memories/.gitkeep

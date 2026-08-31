@@ -1,0 +1,89 @@
+{
+  "$comment": [
+    "Hardening applied ONLY to the autonomous loop, passed via `claude --settings loop-settings.json`",
+    "from scripts/core/auto-loop.sh. It is deliberately NOT .claude/settings.json: those rules would also",
+    "bind interactive sessions in this repo (blocking the maintainer from editing scripts/), and `/path`",
+    "rules in a --settings file anchor to THAT FILE'S DIRECTORY, so this file must stay at the repo root",
+    "for `/MISSION.md` to mean <repo>/MISSION.md.",
+    "Deny rules bind in every permission mode, including bypassPermissions. Allow rules do not, so there are none."
+  ],
+
+  "sandbox": {
+    "enabled": true,
+    "failIfUnavailable": true,
+    "allowUnsandboxedCommands": false,
+    "filesystem": {
+      "denyRead": [
+        "~/.ssh",
+        "~/.aws",
+        "~/.gnupg",
+        "~/.claude",
+        "~/.config",
+        "~/Library/Keychains"
+      ]
+    },
+    "network": {
+      "strictAllowlist": true,
+      "allowedDomains": [
+        "proxy.golang.org",
+        "sum.golang.org",
+        "registry.npmjs.org",
+        "*.npmjs.org"
+      ]
+    }
+  },
+
+  "permissions": {
+    "deny": [
+      "Bash(gh *)",
+      "Bash(wrangler *)",
+      "Bash(sudo *)",
+      "Bash(ssh *)",
+      "Bash(scp *)",
+      "Bash(launchctl *)",
+      "Bash(crontab *)",
+      "Bash(git push *)",
+      "Bash(git remote *)",
+      "Bash(git reset *)",
+      "Bash(rm -rf *)",
+      "Bash(claude *)",
+      "Bash(codex *)",
+      "Bash(dangerouslyDisableSandbox:true)",
+
+      "Read(~/.ssh/**)",
+      "Read(~/.aws/**)",
+      "Read(~/.gnupg/**)",
+      "Read(~/.claude/**)",
+      "Read(**/.env)",
+      "Read(**/.env.*)",
+
+      "Edit(/MISSION.md)",
+      "Edit(/CLAUDE.md)",
+      "Edit(/PROMPT.md)",
+      "Edit(/loop-settings.json)",
+      "Edit(/.claude/**)",
+      "Edit(/.github/**)",
+      "Edit(/.git/**)",
+      "Edit(/.gitignore)",
+      "Edit(/Makefile)",
+      "Edit(/scripts/**)",
+      "Edit(/dashboard/**)",
+      "Edit(/tests/**)"
+    ]
+  },
+
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PROJECT_DIR}/scripts/core/guard-bash.sh",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
