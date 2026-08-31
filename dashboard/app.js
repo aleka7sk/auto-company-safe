@@ -19,6 +19,11 @@ const els = {
   cardAutostart: document.getElementById("cardAutostart"),
 
   stateList: document.getElementById("stateList"),
+  workList: document.getElementById("workList"),
+  guardTail: document.getElementById("guardTail"),
+  productTree: document.getElementById("productTree"),
+  criteriaList: document.getElementById("criteriaList"),
+  criteriaCount: document.getElementById("criteriaCount"),
   consensusText: document.getElementById("consensusText"),
   logText: document.getElementById("logText"),
   rawText: document.getElementById("rawText"),
@@ -174,10 +179,87 @@ function formatTime(isoText) {
   }
 }
 
+function formatAge(seconds) {
+  if (seconds === null || seconds === undefined) return "-";
+  if (seconds < 60) return `${seconds}s ago`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
+  return `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m ago`;
+}
+
+function renderWork(work) {
+  if (!els.workList) return;
+  const w = work || {};
+  const extensions = Object.entries(w.byExtension || {})
+    .map(([ext, n]) => `${ext.replace(".", "")} ${n}`)
+    .join(" · ");
+
+  // A long gap since the last file change while the engine is still running usually means
+  // a long reasoning block, not a hang. Both facts are shown so they can be told apart.
+  const rows = [
+    ["Engine", w.engineRunning ? "working" : "idle"],
+    ["Files authored", w.totalFiles ?? "-"],
+    ["By type", extensions || "-"],
+    ["Last file change", formatAge(w.secondsSinceChange)],
+    ["Last file", w.lastChangedPath || "-"],
+  ];
+
+  els.workList.innerHTML = rows
+    .map(([k, v]) => `<div><dt>${k}</dt><dd>${String(v)}</dd></div>`)
+    .join("");
+}
+
+function escapeHtml(value) {
+  return String(value).replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])
+  );
+}
+
+function renderTree(text) {
+  if (!els.productTree) return;
+  els.productTree.textContent = text || "(nothing built yet)";
+}
+
+function renderCriteria(criteria) {
+  if (!els.criteriaList) return;
+  const items = criteria || [];
+
+  if (!items.length) {
+    els.criteriaList.textContent = "(no acceptance criteria in consensus yet)";
+    if (els.criteriaCount) els.criteriaCount.textContent = "";
+    return;
+  }
+
+  const done = items.filter((c) => c.done).length;
+  if (els.criteriaCount) els.criteriaCount.textContent = `${done}/${items.length}`;
+
+  els.criteriaList.innerHTML = items
+    .map(
+      (c) =>
+        `<div class="criteria-row ${c.done ? "is-done" : ""}">` +
+        `<span class="criteria-mark">${c.done ? "✓" : "○"}</span>` +
+        `<span>${escapeHtml(c.text)}</span></div>`
+    )
+    .join("");
+}
+
+function renderGuardTail(text) {
+  if (!els.guardTail) return;
+  const body = (text || "").trim();
+  els.guardTail.textContent = body || "(no commands recorded yet)";
+  els.guardTail.scrollTop = els.guardTail.scrollHeight;
+}
+
 function renderStateList(parsed, stateFile) {
   const rows = [
+    // Mission lock first: the question that matters at a glance is whether the loop is
+    // still building the product you asked for, and how far along it is.
+    ["Product", stateFile.MISSION_PRODUCT || "-"],
+    ["Criteria Done", stateFile.CRITERIA || "-"],
+    ["Completion", stateFile.COMPLETION_STATUS || "-"],
+    ["Stop Reason", stateFile.STOP_REASON || "-"],
     ["Engine", parsed.loop.engine || "-"],
     ["Model", parsed.loop.model || "-"],
+    ["Effort", stateFile.EFFORT || "-"],
     ["Loop Count", parsed.loop.loopCount || stateFile.LOOP_COUNT || "-"],
     ["Error Count", parsed.loop.errorCount || stateFile.ERROR_COUNT || "-"],
     ["Last Run", parsed.loop.lastRun || stateFile.LAST_RUN || "-"],
@@ -222,6 +304,10 @@ async function fetchStatus() {
   applyCardState(els.cardAutostart, "autostart", autostart.state);
 
   renderStateList(parsed, data.stateFile || {});
+  renderWork(data.work);
+  renderTree(data.tree);
+  renderCriteria(data.criteria);
+  renderGuardTail(data.guardTail);
 
   const consensusRaw = (data.consensusHead || parsed.consensusPreview || "(no consensus)").trim();
   els.consensusText.innerHTML = renderMarkdown(consensusRaw);

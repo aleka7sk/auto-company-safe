@@ -259,9 +259,11 @@ RESET_RUN=1 make start                     # Start over after a finished run
 
 # Engine
 ENGINE=claude make start                   # Engine (codex is unsupported in this fork)
-MODEL=sonnet make start                    # Optional model override
+EFFORT=max make start                      # Reasoning effort: low|medium|high|xhigh|max (default max)
+MAX_BUDGET_USD=5 make start                # Per-cycle spend ceiling enforced by the CLI (0 = off)
+MODEL=sonnet make start                    # Optional model override; empty inherits ~/.claude/settings.json
 LOOP_INTERVAL=60 make start                # 60s interval (default 30)
-CYCLE_TIMEOUT_SECONDS=3600 make start      # 1h cycle timeout (default 1800)
+CYCLE_TIMEOUT_SECONDS=18000 make start     # Per-cycle timeout, default 10800 (3h); 0 = no watchdog
 MAX_CONSECUTIVE_ERRORS=3 make start        # Circuit-breaker threshold (default 5)
 CLAUDE_BIN=/usr/local/bin/claude make start     # Optional Claude binary override
 

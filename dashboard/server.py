@@ -32,6 +32,25 @@ MACOS_STOP_SCRIPT = REPO_ROOT / "scripts" / "core" / "stop-loop.sh"
 LOG_FILE = REPO_ROOT / "logs" / "auto-loop.log"
 STATE_FILE = REPO_ROOT / ".auto-loop-state"
 CONSENSUS_FILE = REPO_ROOT / "memories" / "consensus.md"
+# auto-loop.log only gets a line when a cycle starts and ends, so during a multi-hour
+# cycle it says nothing. These two are what actually move while the team is working.
+GUARD_LOG = REPO_ROOT / "logs" / "guard-audit.log"
+PRODUCTS_DIR = REPO_ROOT / "projects"
+
+# Directories that hold dependencies or caches rather than authored work.
+WORK_SKIP_DIRS = {
+    "node_modules",
+    ".npm-cache",
+    ".git",
+    ".gocache",
+    "dist",
+    "build",
+    "tmp",
+    "vendor",
+    "bin",
+    ".venv",
+}
+WORK_EXTENSIONS = {".go", ".ts", ".tsx", ".js", ".jsx", ".sql", ".md", ".css", ".yaml", ".yml"}
 
 WINDOWS_HOST = "windows"
 MACOS_HOST = "macos"
@@ -415,6 +434,132 @@ def parse_status_output(raw: str, system_name: str | None = None) -> dict[str, A
     return profile["parser"](raw)
 
 
+def summarize_product_work() -> dict[str, Any]:
+    """Count authored files under projects/ and note when one last changed.
+
+    This is the only signal that moves during a long cycle: the state file updates at
+    cycle boundaries and the model rewrites the consensus at the end, so without this the
+    dashboard looks frozen while the team is in fact working.
+    """
+    by_extension: dict[str, int] = {}
+    total_files = 0
+    newest_mtime = 0.0
+    newest_path = ""
+
+    if PRODUCTS_DIR.is_dir():
+        for root, dirs, files in os.walk(PRODUCTS_DIR):
+            dirs[:] = [d for d in dirs if d not in WORK_SKIP_DIRS]
+            for name in files:
+                extension = os.path.splitext(name)[1]
+                if extension not in WORK_EXTENSIONS:
+                    continue
+                total_files += 1
+                by_extension[extension] = by_extension.get(extension, 0) + 1
+                try:
+                    mtime = os.path.getmtime(os.path.join(root, name))
+                except OSError:
+                    continue
+                if mtime > newest_mtime:
+                    newest_mtime = mtime
+                    newest_path = os.path.relpath(os.path.join(root, name), REPO_ROOT)
+
+    last_change = ""
+    seconds_since_change: int | None = None
+    if newest_mtime:
+        last_change = datetime.fromtimestamp(newest_mtime, timezone.utc).isoformat()
+        seconds_since_change = max(0, int(time.time() - newest_mtime))
+
+    return {
+        "totalFiles": total_files,
+        "byExtension": dict(sorted(by_extension.items(), key=lambda kv: -kv[1])),
+        "lastChangedPath": newest_path,
+        "lastChangedAt": last_change,
+        "secondsSinceChange": seconds_since_change,
+        "engineRunning": engine_is_running(),
+    }
+
+
+def build_product_tree(max_entries: int = 220) -> str:
+    """Render the product directory as an indented tree.
+
+    File counts answer "how much", but not "what". This shows the shape of what the team
+    actually built, which is the thing you check a scaffold against.
+    """
+    if not PRODUCTS_DIR.is_dir():
+        return "(no projects/ directory yet)"
+
+    lines: list[str] = []
+    truncated = False
+
+    for product in sorted(p for p in PRODUCTS_DIR.iterdir() if p.is_dir()):
+        lines.append(f"{product.name}/")
+        for root, dirs, files in os.walk(product):
+            dirs[:] = sorted(d for d in dirs if d not in WORK_SKIP_DIRS and not d.startswith("."))
+            relative = os.path.relpath(root, product)
+            depth = 0 if relative == "." else relative.count(os.sep) + 1
+            indent = "  " * (depth + 1)
+
+            if relative != ".":
+                # No extra padding here: the directory header sits one level shallower
+                # than the files it contains, which is what makes the nesting readable.
+                lines.append(f"{'  ' * depth}{os.path.basename(root)}/")
+
+            for name in sorted(files):
+                if name.startswith("."):
+                    continue
+                if len(lines) >= max_entries:
+                    truncated = True
+                    break
+                try:
+                    size = os.path.getsize(os.path.join(root, name))
+                except OSError:
+                    size = 0
+                lines.append(f"{indent}{name}  ({size:,}b)")
+            if truncated:
+                break
+        if truncated:
+            break
+
+    if truncated:
+        lines.append("... (truncated)")
+    return "\n".join(lines) if lines else "(nothing built yet)"
+
+
+def parse_acceptance_criteria() -> list[dict[str, Any]]:
+    """Pull the acceptance checklist out of the consensus.
+
+    The consensus preview is truncated at 3000 characters, so with a long brief the
+    criteria never appear in it — yet they are the actual definition of progress.
+    """
+    text = read_text_file(CONSENSUS_FILE, "")
+    if not text:
+        return []
+
+    criteria: list[dict[str, Any]] = []
+    in_section = False
+    for line in text.splitlines():
+        if line.startswith("## "):
+            in_section = line.strip() == "## Acceptance Criteria"
+            continue
+        if not in_section:
+            continue
+        match = re.match(r"^\s*-\s*\[([ xX])\]\s*(.+)$", line)
+        if match:
+            criteria.append({"done": match.group(1).lower() == "x", "text": match.group(2).strip()})
+    return criteria
+
+
+def engine_is_running() -> bool:
+    """True while a headless engine process is mid-cycle."""
+    try:
+        proc = subprocess.run(
+            ["pgrep", "-f", "claude -p"], capture_output=True, text=True, timeout=5
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return proc.returncode == 0 and bool(proc.stdout.strip())
+
+
 def gather_status_payload(system_name: str | None = None) -> dict[str, Any]:
     result = run_status_command(system_name)
     parsed = parse_status_output(result["output"], system_name)
@@ -428,6 +573,10 @@ def gather_status_payload(system_name: str | None = None) -> dict[str, Any]:
         "stateFile": read_state_file_pairs(),
         "consensusHead": read_text_file(CONSENSUS_FILE, "(no consensus file)")[:3000],
         "logTail": read_tail(LOG_FILE, lines=180),
+        "guardTail": read_tail(GUARD_LOG, lines=40),
+        "work": summarize_product_work(),
+        "tree": build_product_tree(),
+        "criteria": parse_acceptance_criteria(),
     }
 
 

@@ -436,3 +436,34 @@ select {
     grid-template-columns: 1fr;
   }
 }
+
+/* Acceptance criteria checklist */
+.criteria-list {
+  max-height: 320px;
+  overflow-y: auto;
+  font-size: 12px;
+  line-height: 1.5;
+}
+.criteria-row {
+  display: flex;
+  gap: 8px;
+  padding: 4px 0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+  opacity: 0.75;
+}
+.criteria-row.is-done {
+  opacity: 1;
+}
+.criteria-mark {
+  flex: 0 0 14px;
+  opacity: 0.5;
+}
+.criteria-row.is-done .criteria-mark {
+  color: #4ade80;
+  opacity: 1;
+}
+.muted {
+  opacity: 0.6;
+  font-weight: normal;
+  font-size: 12px;
+}

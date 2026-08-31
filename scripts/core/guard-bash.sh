@@ -44,7 +44,12 @@ BLOCK_RE="$BLOCK_RE"'|(^|[;&|[:space:]])(gh|wrangler)([[:space:]]|$)'
 BLOCK_RE="$BLOCK_RE"'|git[[:space:]]+(push|remote)([[:space:]]|$)'
 BLOCK_RE="$BLOCK_RE"'|rm[[:space:]]+(-[[:alnum:]]*[[:space:]]+)*-?[[:alnum:]]*[rf]{2}[[:alnum:]]*[[:space:]]+(/|~|\$HOME)'
 BLOCK_RE="$BLOCK_RE"'|(curl|wget)[^|]*\|[[:space:]]*(sudo[[:space:]]+)?(ba)?sh'
-BLOCK_RE="$BLOCK_RE"'|(\.ssh|\.aws|\.gnupg|\.claude)/'
+BLOCK_RE="$BLOCK_RE"'|(\.ssh|\.aws|\.gnupg)/'
+# Only the HOME copy of .claude is off limits: it holds the user's credentials and config.
+# The project's own .claude/ carries the skills and agent definitions the cycle prompt
+# explicitly tells the team to read, so blocking it made the loop unable to follow its own
+# instructions. Writes there stay blocked by the Edit(/.claude/**) deny rule.
+BLOCK_RE="$BLOCK_RE"'|(~|\$HOME|/Users/[^/[:space:]]+)/\.claude'
 
 if printf '%s' "$cmd" | grep -Eq "$BLOCK_RE"; then
     log_attempt "BLOCKED"

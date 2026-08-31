@@ -179,6 +179,10 @@ cat > "$PLIST_PATH" << EOF
         <string>${CODEX_BIN}</string>
         <key>CODEX_SANDBOX_MODE</key>
         <string>${CODEX_SANDBOX_MODE}</string>
+        <key>EFFORT</key>
+        <string>${EFFORT:-max}</string>
+        <key>MAX_BUDGET_USD</key>
+        <string>${MAX_BUDGET_USD:-0}</string>
         <key>MAX_CYCLES</key>
         <string>${MAX_CYCLES:-40}</string>
         <key>MAX_RUNTIME_SECONDS</key>

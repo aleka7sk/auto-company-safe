@@ -23,7 +23,7 @@
 #   CODEX_SANDBOX_MODE=danger-full-access
 #                               # Codex sandbox mode (only for ENGINE=codex)
 #   LOOP_INTERVAL=30            # Seconds between cycles (default: 30)
-#   CYCLE_TIMEOUT_SECONDS=1800  # Max seconds per cycle before force-kill
+#   CYCLE_TIMEOUT_SECONDS=10800 # Max seconds per cycle before force-kill (0 = no watchdog)
 #   MAX_CONSECUTIVE_ERRORS=5    # Circuit breaker threshold
 #   COOLDOWN_SECONDS=300        # Cooldown after circuit break
 #   LIMIT_WAIT_SECONDS=3600     # Wait on usage limit
@@ -51,12 +51,26 @@ ENGINE="${ENGINE:-claude}"
 ENGINE="$(echo "$ENGINE" | tr '[:upper:]' '[:lower:]')"
 MODEL="${MODEL:-}"
 MODEL_LABEL="${MODEL:-config-default}"
+# Reasoning effort for each cycle. Without this the loop inherits effortLevel from
+# ~/.claude/settings.json, which is easy to change by accident and invisible in the run
+# record. Pinned here so a run's effort is part of its configuration, not ambient state.
+# Valid: low medium high xhigh max (the CLI warns and silently falls back on anything else).
+EFFORT="${EFFORT:-max}"
+# CLI-enforced spend ceiling. --max-budget-usd only works with --print, which is how the
+# loop invokes the engine. 0 disables it. This is a harder stop than counting cost in bash:
+# the CLI aborts the call itself rather than the supervisor noticing after the fact.
+MAX_BUDGET_USD="${MAX_BUDGET_USD:-0}"
 CLAUDE_BIN="${CLAUDE_BIN:-}"
 CLAUDE_PERMISSION_MODE="${CLAUDE_PERMISSION_MODE:-bypassPermissions}"
 CODEX_BIN="${CODEX_BIN:-}"
 CODEX_SANDBOX_MODE="${CODEX_SANDBOX_MODE:-danger-full-access}"
 LOOP_INTERVAL="${LOOP_INTERVAL:-30}"
-CYCLE_TIMEOUT_SECONDS="${CYCLE_TIMEOUT_SECONDS:-1800}"
+# 3 hours. The old 1800 default cut cycles off mid-task on a brief of any real size, and a
+# killed cycle only keeps its work when the consensus happened to be written first.
+# 0 disables the watchdog entirely — see run_claude_cycle. Note that with no watchdog a
+# hung engine is unbounded: MAX_CYCLES and MAX_RUNTIME_SECONDS are only checked between
+# cycles, so neither can interrupt one that never returns.
+CYCLE_TIMEOUT_SECONDS="${CYCLE_TIMEOUT_SECONDS:-10800}"
 MAX_CONSECUTIVE_ERRORS="${MAX_CONSECUTIVE_ERRORS:-5}"
 COOLDOWN_SECONDS="${COOLDOWN_SECONDS:-300}"
 LIMIT_WAIT_SECONDS="${LIMIT_WAIT_SECONDS:-3600}"
@@ -88,6 +102,21 @@ if [ "$ENGINE" != "claude" ] && [ "$ENGINE" != "codex" ]; then
     echo "Error: ENGINE must be 'claude' or 'codex' (received: '$ENGINE')."
     exit 1
 fi
+
+# Fail loudly rather than let the CLI warn once and quietly run the whole night at the
+# default effort, which is the failure this check exists to prevent.
+#
+# `ultracode` is accepted by the CLI even though its own warning text lists only the five
+# base levels. It is not a level above `max`: per the docs it pairs xhigh reasoning with
+# automatic workflow orchestration, so each cycle may spawn workflows on top of the 2-5
+# teammates team/SKILL.md already creates. Allowed here, but max is the default on purpose.
+case "$EFFORT" in
+    low|medium|high|xhigh|max|ultracode) ;;
+    *)
+        echo "Error: EFFORT must be one of low, medium, high, xhigh, max, ultracode (received: '$EFFORT')."
+        exit 1
+        ;;
+esac
 
 # Keep Agent Teams compatibility for legacy prompts/config.
 export CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1
@@ -168,6 +197,7 @@ ERROR_COUNT=$error_count
 LAST_RUN=$(date '+%Y-%m-%d %H:%M:%S')
 STATUS=$1
 MODEL=$MODEL_LABEL
+EFFORT=$EFFORT
 ENGINE=$ENGINE
 MISSION_PRODUCT=$MISSION_PRODUCT
 COMPLETION_STATUS=$(read_completion_status)
@@ -686,7 +716,10 @@ run_codex_cycle() {
         "${codex_cmd[@]}"
     ) > "$output_file" 2>&1 &
     local codex_pid=$!
+    local watchdog_pid=""
 
+    # Same 0-means-no-watchdog rule as the claude path; see run_claude_cycle.
+    if [ "$CYCLE_TIMEOUT_SECONDS" -gt 0 ]; then
     (
         sleep "$CYCLE_TIMEOUT_SECONDS"
         if kill -0 "$codex_pid" 2>/dev/null; then
@@ -695,14 +728,18 @@ run_codex_cycle() {
             sleep 5
             kill -KILL "$codex_pid" 2>/dev/null || true
         fi
-    ) &
-    local watchdog_pid=$!
+    ) >/dev/null 2>&1 &
+    watchdog_pid=$!
+    fi
 
     wait "$codex_pid"
     EXIT_CODE=$?
 
-    kill "$watchdog_pid" 2>/dev/null || true
-    wait "$watchdog_pid" 2>/dev/null || true
+    if [ -n "$watchdog_pid" ]; then
+        pkill -P "$watchdog_pid" 2>/dev/null || true
+        kill "$watchdog_pid" 2>/dev/null || true
+        wait "$watchdog_pid" 2>/dev/null || true
+    fi
     set -e
 
     OUTPUT=$(cat "$output_file")
@@ -733,6 +770,10 @@ run_claude_cycle() {
         # .claude/settings.json so they bind the unattended loop without also
         # binding interactive sessions in this repo.
         claude_cmd+=("--settings" "$LOOP_SETTINGS_FILE")
+        claude_cmd+=("--effort" "$EFFORT")
+        if [ "$MAX_BUDGET_USD" != "0" ]; then
+            claude_cmd+=("--max-budget-usd" "$MAX_BUDGET_USD")
+        fi
         if [ -n "$MODEL" ]; then
             claude_cmd+=("--model" "$MODEL")
         fi
@@ -744,22 +785,33 @@ run_claude_cycle() {
     local claude_pid=$!
     ENGINE_PID="$claude_pid"
 
-    (
-        sleep "$CYCLE_TIMEOUT_SECONDS"
-        if kill -0 "$claude_pid" 2>/dev/null; then
-            echo "1" > "$timeout_flag"
-            kill -TERM "$claude_pid" 2>/dev/null || true
-            sleep 5
-            kill -KILL "$claude_pid" 2>/dev/null || true
-        fi
-    ) &
-    local watchdog_pid=$!
+    # 0 means no watchdog. Without this branch `sleep 0` returns immediately and the
+    # engine is killed on the spot — the opposite of "no limit", and a silent one.
+    local watchdog_pid=""
+    if [ "$CYCLE_TIMEOUT_SECONDS" -gt 0 ]; then
+        (
+            sleep "$CYCLE_TIMEOUT_SECONDS"
+            if kill -0 "$claude_pid" 2>/dev/null; then
+                echo "1" > "$timeout_flag"
+                kill -TERM "$claude_pid" 2>/dev/null || true
+                sleep 5
+                kill -KILL "$claude_pid" 2>/dev/null || true
+            fi
+        ) >/dev/null 2>&1 &
+        watchdog_pid=$!
+    fi
 
     wait "$claude_pid"
     EXIT_CODE=$?
 
-    kill "$watchdog_pid" 2>/dev/null || true
-    wait "$watchdog_pid" 2>/dev/null || true
+    if [ -n "$watchdog_pid" ]; then
+        # Kill the subshell's `sleep` child first. Killing only the subshell leaves the
+        # sleep orphaned for the full timeout, and an orphan that inherited stdout keeps
+        # any pipe reading the loop's output open long after the loop exits.
+        pkill -P "$watchdog_pid" 2>/dev/null || true
+        kill "$watchdog_pid" 2>/dev/null || true
+        wait "$watchdog_pid" 2>/dev/null || true
+    fi
     set -e
 
     OUTPUT=$(cat "$output_file")
@@ -971,7 +1023,12 @@ log "Project: $PROJECT_DIR"
 if [ "$ENGINE" = "codex" ]; then
     log "Engine: codex | Model: $MODEL_LABEL | Sandbox: $CODEX_SANDBOX_MODE"
 else
-    log "Engine: claude | Model: $MODEL_LABEL | PermissionMode: $CLAUDE_PERMISSION_MODE"
+    log "Engine: claude | Model: $MODEL_LABEL | Effort: $EFFORT | PermissionMode: $CLAUDE_PERMISSION_MODE"
+    [ "$MAX_BUDGET_USD" != "0" ] && log "Per-cycle budget ceiling: \$$MAX_BUDGET_USD"
+    if [ "$EFFORT" = "ultracode" ]; then
+        log "WARNING: ultracode lets each cycle spawn workflows on top of its own team fan-out."
+        log "         Expect a large quota increase and a higher chance of hitting the ${CYCLE_TIMEOUT_SECONDS}s cycle timeout."
+    fi
 fi
 log "Engine bin: $RESOLVED_ENGINE_BIN"
 engine_version=$("$RESOLVED_ENGINE_BIN" --version 2>/dev/null | head -n1 || true)
