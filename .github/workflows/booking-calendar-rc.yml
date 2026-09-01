@@ -1,0 +1,90 @@
+name: Booking Calendar RC
+
+on:
+  push:
+    branches:
+      - auto/booking-calendar-russian-release-candidate
+    paths:
+      - projects/booking-calendar/**
+      - .github/workflows/booking-calendar-rc.yml
+  pull_request:
+    paths:
+      - projects/booking-calendar/**
+      - .github/workflows/booking-calendar-rc.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  backend-and-schema:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: projects/booking-calendar
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: projects/booking-calendar/go.mod
+          cache-dependency-path: projects/booking-calendar/go.sum
+      - name: Format check
+        run: test -z "$(gofmt -l .)"
+      - name: Go build
+        run: go build ./...
+      - name: Go vet
+        run: go vet ./...
+      - name: Go tests
+        run: go test ./...
+      - name: Schema invariant tests
+        run: python3 -m unittest tests.test_schema_invariants
+
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: projects/booking-calendar
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: projects/booking-calendar/web/package-lock.json
+      - name: Install
+        run: npm ci --prefix web
+      - name: Russian UI guard
+        run: npm run check:ru --prefix web
+      - name: Unit and workflow tests
+        run: npm test --prefix web -- --run
+      - name: Production build
+        run: npm run build --prefix web
+
+  browser:
+    runs-on: ubuntu-latest
+    needs: [backend-and-schema, frontend]
+    defaults:
+      run:
+        working-directory: projects/booking-calendar
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: projects/booking-calendar/go.mod
+          cache-dependency-path: projects/booking-calendar/go.sum
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: projects/booking-calendar/web/package-lock.json
+      - run: npm ci --prefix web
+      - run: npx --prefix web playwright install --with-deps chromium
+      - name: Browser verification
+        run: npm run test:e2e --prefix web
+      - name: Upload Playwright report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: booking-calendar-playwright-report
+          path: projects/booking-calendar/web/playwright-report
+          if-no-files-found: ignore
