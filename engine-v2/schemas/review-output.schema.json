@@ -1,0 +1,11 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["verdict", "criteria", "findings"],
+  "properties": {
+    "verdict": {"enum": ["PASS", "FAIL", "BLOCKED"]},
+    "criteria": {"type": "array", "items": {"type": "object", "additionalProperties": false, "required": ["criterion_id", "verdict", "reason", "references"], "properties": {"criterion_id": {"type": "string"}, "verdict": {"enum": ["PASS", "FAIL", "BLOCKED"]}, "reason": {"type": "string"}, "references": {"type": "array", "items": {"type": "string"}}}}},
+    "findings": {"type": "array", "items": {"type": "object", "additionalProperties": false, "required": ["severity", "title", "description", "criterion_ids"], "properties": {"severity": {"enum": ["P0", "P1", "P2", "P3"]}, "title": {"type": "string"}, "description": {"type": "string"}, "criterion_ids": {"type": "array", "items": {"type": "string"}}}}}
+  }
+}

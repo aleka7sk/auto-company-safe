@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["facts", "user_statements", "assumptions", "unknowns", "evidence_for", "evidence_against", "smallest_valuable_wedge", "value_proposals", "owner_decisions"],
+  "properties": {
+    "facts": {"type": "array", "items": {"type": "object", "required": ["claim", "source"], "properties": {"claim": {"type": "string"}, "source": {"type": "string"}}, "additionalProperties": false}, "maxItems": 30},
+    "user_statements": {"type": "array", "items": {"type": "string"}, "maxItems": 20},
+    "assumptions": {"type": "array", "items": {"type": "string"}, "maxItems": 20},
+    "unknowns": {"type": "array", "items": {"type": "string"}, "maxItems": 20},
+    "evidence_for": {"type": "array", "items": {"type": "string"}, "maxItems": 20},
+    "evidence_against": {"type": "array", "items": {"type": "string"}, "maxItems": 20},
+    "smallest_valuable_wedge": {"type": "string", "minLength": 1},
+    "value_proposals": {"type": "array", "maxItems": 3, "items": {"type": "object", "additionalProperties": false, "required": ["title", "user_outcome", "validation", "cost_risk", "recommendation"], "properties": {"title": {"type": "string"}, "user_outcome": {"type": "string"}, "validation": {"type": "string"}, "cost_risk": {"type": "string"}, "recommendation": {"enum": ["now", "later", "reject"]}}}},
+    "owner_decisions": {"type": "array", "maxItems": 5, "items": {"type": "string"}}
+  }
+}
