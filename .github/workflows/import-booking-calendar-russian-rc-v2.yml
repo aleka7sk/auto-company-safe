@@ -1,0 +1,101 @@
+name: Import Booking Calendar Russian RC v2
+
+on:
+  push:
+    branches:
+      - auto/booking-calendar-russian-release-candidate
+    paths:
+      - .github/workflows/import-booking-calendar-russian-rc-v2.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: import-booking-calendar-russian-rc-v2
+  cancel-in-progress: false
+
+jobs:
+  import-source:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout delivery branch
+        uses: actions/checkout@v4
+        with:
+          ref: auto/booking-calendar-russian-release-candidate
+          fetch-depth: 0
+
+      - name: Download prepared source snapshot
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 4 --retry-delay 5 \
+            'https://filebin.net/autoco-bc-rc-20260901-v2-94860628/booking-calendar-russian-release-candidate.tar.gz' \
+            --output /tmp/booking-calendar.tar.gz
+          tar -tzf /tmp/booking-calendar.tar.gz >/dev/null
+
+      - name: Import tracked product tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf projects/booking-calendar
+          mkdir -p projects/booking-calendar
+          tar -xzf /tmp/booking-calendar.tar.gz \
+            -C projects/booking-calendar \
+            --strip-components=1
+
+          rm -rf \
+            projects/booking-calendar/.git \
+            projects/booking-calendar/node_modules \
+            projects/booking-calendar/web/node_modules \
+            projects/booking-calendar/web/dist \
+            projects/booking-calendar/web/test-results \
+            projects/booking-calendar/web/playwright-report \
+            projects/booking-calendar/bin
+          find projects/booking-calendar -type f \
+            \( -name '*.db' -o -name '*.db-shm' -o -name '*.db-wal' -o -name '.env' -o -name '.env.*' \) \
+            -delete
+
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('.gitignore')
+          text = p.read_text(encoding='utf-8') if p.exists() else ''
+          marker = '\n# Auto Company controlled product snapshots\n'
+          if marker in text:
+              text = text.split(marker, 1)[0].rstrip() + '\n'
+          text = text.rstrip() + marker + '''!projects/
+          projects/*
+          !projects/booking-calendar/
+          !projects/booking-calendar/**
+          '''
+          p.write_text(text, encoding='utf-8')
+          PY
+
+      - name: Reject generated data and secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+          test ! -d projects/booking-calendar/.git
+          test ! -d projects/booking-calendar/node_modules
+          test ! -d projects/booking-calendar/web/node_modules
+          test ! -d projects/booking-calendar/web/dist
+          if find projects/booking-calendar -type f \
+            \( -name '.env' -o -name '.env.*' -o -name '*.db' -o -name '*.db-shm' -o -name '*.db-wal' \) \
+            -print -quit | grep -q .; then
+            echo 'Forbidden generated or secret file detected.' >&2
+            exit 1
+          fi
+
+      - name: Commit imported release candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'auto-company-delivery'
+          git config user.email 'actions@users.noreply.github.com'
+          git add .gitignore projects/booking-calendar
+          if git diff --cached --quiet; then
+            echo 'No product changes to commit.'
+            exit 0
+          fi
+          git commit -m 'feat(booking-calendar): refresh Russian Kazakhstan release candidate'
+          git push origin HEAD:auto/booking-calendar-russian-release-candidate
